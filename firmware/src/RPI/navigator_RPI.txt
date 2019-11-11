@@ -1,0 +1,745 @@
+#include "ros/ros.h"
+#include <sstream>
+#include <std_msgs/Int16.h>
+#include <wiringPi.h>
+
+#include <unistd.h>
+#include "serial/serial.h"
+
+#include <iostream>
+#include<cstdio>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <math.h>
+
+#define MOVD1_PIN     24
+#define MOVD0_PIN     25
+
+//INIT THE SERIAL----------------------------------------------------------------------
+serial::Serial uart_port ("/dev/ttyAMA0", 115200, serial::Timeout::simpleTimeout(250));
+
+//UART FUNCTIONS-----------------------------------------------------------------------
+char verifyData();
+short int readPIC();
+void writePIC(char address, short data);
+
+//ROUTE FUNCTIONS----------------------------------------------------------------------
+void readRoute();
+void cubicBezier(short int x1, short int x2, short int x3, short int x4, short int y1, short int y2, short int y3, short int y4, char lastCurve);
+
+//SONAR FUNCTIONS----------------------------------------------------------------------
+void sonarCallback(const std_msgs::Int16::ConstPtr& msg);
+
+//NAVIGATION FUNCTIONS-----------------------------------------------------------------
+float calculeDistance(short int targetPosX, short int targetPosY, short int currentPosX, short int currentPosY);
+short int calculeAngularDisplacement(float distance, short int currentOrientation);
+float displacementX(short int step, short int currentOrientation);
+float displacementY(short int step, short int currentOrientation);
+
+//ESCAPE FUNCTIONS---------------------------------------------------------------
+short int getRunawayDistance();
+void calculatesRunawayRoute(short int runawayDistance, short int p1x, short int p1y, short int p2x, short int p2y);
+
+//Says if the RPI reads all pic data
+short int RX_COMPLETE = 0;
+//Data registers
+short int odometry_step = 0, odometry_spin = 0;
+//Route
+std::vector<short int> routeX, routeY;
+//Route state
+int routeState = 0;
+//New coordinate to go
+bool newCoordinate = true;
+//New coordinate navigation variables
+short int angularDisplacement = 0;
+float distance = 0;
+//Navigation data
+float posX = 0, posY = 0;
+short int orientation = 0, desiredOrientation = 0, o_dist = 100;
+//Movement type
+char *moveType = "STOPPED";
+//Route finished
+bool finished = false;
+//Saves the delta X and delta Y to the coordinate
+short int dx = 0, dy = 0;
+//Saves the quadrant coordinate
+short int quadrant = 0;
+//Object detected state
+bool objectDetected = false;
+//Last escape start coordinate
+short int lastRunPosX = 0, lastRunPosY = 0;
+
+//Executed route
+std::vector<short int> executedRouteX, executedRouteY;
+
+int main(int argc, char **argv){
+        //Start GPIO
+        wiringPiSetup () ;
+
+        //Set the movement type pins as output to pic
+        pinMode (MOVD1_PIN, OUTPUT);
+        pinMode (MOVD0_PIN, OUTPUT);
+        //Set the pins low to stop robot
+        digitalWrite(MOVD1_PIN, LOW);
+        digitalWrite(MOVD0_PIN, LOW);
+
+        //CREATES A NODE HANDLE----------------------------------------------------------------
+        ros::init(argc, argv, "navigator");
+        ros::NodeHandle n;
+        ros::Rate rate(100);
+        ros::Subscriber sub = n.subscribe("sonar_chatter", 10, sonarCallback);
+
+        //Creates the route
+        readRoute();
+
+        printf("-> ROUTE LOADED: %d points\n", (int) routeX.size());
+        for(int i=0; i<routeX.size(); i++)
+            printf("%d, %d\n" ,routeX[i], routeY[i]);
+        printf("\n");
+
+        while (ros::ok() && !finished){
+                //Detect object
+                if(o_dist < 40 && o_dist < (short int)distance && moveType == "MOVING FORWARD" && (lastRunPosX != (short int)posX || lastRunPosY != (short int)posY))
+                        objectDetected = true;
+
+                //Read PIC data monitoring
+                if(readPIC() == 2 && RX_COMPLETE == 3){
+
+                        //Verifies if the spin move is to the right
+                        if(angularDisplacement > 0){
+                                //Set the movement type pins to turn right
+                                digitalWrite(MOVD1_PIN, HIGH);
+                                digitalWrite(MOVD0_PIN, HIGH);
+                                //Updates orientation
+                                orientation -= odometry_spin;
+                                if(orientation < 0)
+                                        orientation+=360;
+
+                                moveType = "TURNING LEFT";
+                                //Update the angular displacement has left
+                                angularDisplacement+=odometry_spin;
+
+                                //Finishs the spin with 5cm error margin
+                                if(angularDisplacement > -5)
+                                        angularDisplacement = 0;
+                        }
+                        //If the spin move has completed, moves forward
+                        else{
+                                //Set the movement type to move forward
+                                digitalWrite(MOVD1_PIN, LOW);
+                                digitalWrite(MOVD0_PIN, HIGH);
+                                //Updates the current coordinate
+                                posX+=displacementX(odometry_step, orientation);
+                                posY+=displacementY(odometry_step, orientation);
+
+                                //Add the new coordinate on executed route
+                                executedRouteX.push_back((short int)posX);
+                                executedRouteY.push_back((short int)posY);
+
+                                //Updates the distance has left
+                                distance-=odometry_step;
+                                moveType = "MOVING FORWARD";
+
+                                //Verifies if the displacement is dono
+                                if(distance <= 0){
+                                        //Wait for new coordinate
+                                        if(routeState < routeX.size() - 1){
+                                                newCoordinate = true;
+                                                routeState++;
+                                        }
+                                        //Finishs the route and stop the robot
+                                        else
+                                                finished = true;
+                                }
+                        }
+                        printf("-> %s\nCurrent position: (%.2f, %.2f)cm\nCurrent orientation: %dº\nRobot step: %dcm\nRobot spin: %d°\nDisplacement in x: %.2fcm\nDisplacement in y: %.2fcm\nNearest object $
+                        RX_COMPLETE = 0;
+
+                        //If any object has detected
+                        if(objectDetected){
+                                //Send a request to vision program
+                                short int runawayResponse = 0;
+                                runawayResponse = getRunawayDistance();
+
+                                //If a object has detected, generate a escape route
+                                if(runawayResponse != 0){
+                                        printf("-> EXPECTED COLISION AT %dcm\n", o_dist);
+                                        printf("Generating escape route...\n");
+                                        calculatesRunawayRoute(runawayResponse, (short int)posX, (short int)posY, routeX[routeState], routeY[routeState]);
+                                        newCoordinate = true;
+                                        routeState++;
+                                }
+                                objectDetected = false;
+                        }
+                }
+                //Calcules distance and angular displacement to new coordinate
+                if(newCoordinate){
+                        newCoordinate = false;
+                        distance = calculeDistance(routeX[routeState], routeY[routeState], (short int)posX, (short int)posY);
+                        angularDisplacement = calculeAngularDisplacement(distance, orientation);
+                        desiredOrientation = orientation + angularDisplacement;
+
+                        if(desiredOrientation >= 360)
+                                desiredOrientation -= 360;
+                        else if(desiredOrientation < 0)
+                                desiredOrientation += 360;
+                        printf("\n---------------------------------------------------------------------\n-> GO TO %dº COORDINATE: (%d, %d)cm\n", (routeState+1), routeX[routeState], routeY[routeState]);
+                        printf("Current position: (%.2f, %.2f)cm\nDistance: %.2fcm\nCurrent orientation: %dº\nDesired orientation: %d°\nAngular displacement: %dº\nNext quadrant: %d\n\n", posX, posY, dist$
+                }
+
+                ros::spinOnce();
+        }
+        printf("-> ROUTE FINISHED\n");
+        printf("Walked path:\n");
+        for(int i = 0; i < executedRouteX.size(); i++)
+                printf("%d,%d\n", executedRouteX[i], executedRouteY[i]);
+
+        digitalWrite(MOVD1_PIN, LOW);
+        digitalWrite(MOVD0_PIN, LOW);
+
+        //CLOSE SERIAL---------------
+        uart_port.close();
+        //---------------------------
+        return 0;
+}
+
+
+//UART FUNCTIONS------------------------------------------------------------------------------
+//Uses U1TX and U1RX
+#define RX_FREE 0
+#define RX_READING 1
+#define RX_OK 2
+
+//Represents the serial read state machine
+short int readState = 0;
+//Saves the received bytes from serial(implemented on communication protocol)
+char receivedBytes[] = {0,0,0,0};
+//Saves the message received address
+char address = 0;
+//Saves the message received data
+short int data = 0;
+
+//Verifies if the received message implements the protocol
+char verifyData(){
+    short int i = 0;
+    char confirmBytes[] = {0,0,0,0};
+    char organizedBytes[] = {0,0,0,0};
+
+    //Checks 4 bytes message
+    for(i = 0; i < 4; i++){
+        //Search for the first byte message
+        if(((receivedBytes[i] >> 6) & 0x03) == 0){
+            confirmBytes[0] = 1;
+            organizedBytes[0] = receivedBytes[i];
+        }
+        //Search for the second byte message
+        else if(((receivedBytes[i] >> 6) & 0x03) == 1){
+            confirmBytes[1] = 1;
+            organizedBytes[1] = receivedBytes[i];
+        }
+        //Search for the third byte message
+        else if(((receivedBytes[i] >> 6) & 0x03) == 2){
+            confirmBytes[2] = 1;
+            organizedBytes[2] = receivedBytes[i];
+        }
+        //Search for the fourth byte message
+       else if(((receivedBytes[i] >> 6) & 0x03) == 3){
+            confirmBytes[3] = 1;
+            organizedBytes[3] = receivedBytes[i];
+        }
+        //If the bytes is out of the pattern
+        else 
+            return 0;
+    }
+
+    //If the bytes is on protocol pattern
+    if((confirmBytes[0] & confirmBytes[1] & confirmBytes[2] & confirmBytes[3]) == 1){
+        short int recBytes[] = {organizedBytes[1], organizedBytes[2], organizedBytes[3]};
+
+        //Takes the address data
+        address = ((organizedBytes[0] << 2) & 0b11111100) | (((organizedBytes[1] << 2) >> 6) & 0b000$
+        //Takes the data
+        data = ((recBytes[0] << 12) & 0b1111000000000000) | ((recBytes[1] << 6) & 0b0000111111000000$
+
+        return 1;
+    }
+
+    return 0;
+}
+
+
+//Reads the PIC data
+short int readPIC(){
+    //If contains byte on rx
+    if (uart_port.waitReadable())
+    {
+        //Read byte
+        std::stringstream ss;
+        ss << uart_port.read(1);
+
+        receivedBytes[readState] = ss.str().c_str()[0];
+
+        //Controls the read state machine
+        if(readState != 3)
+            readState++;
+        else{
+            readState = 0;
+
+            //Confirms read
+            if(verifyData() == 1){
+                RX_COMPLETE++;
+                if(address == 1)
+                    odometry_step = data;
+                else if(address == 2)
+                    odometry_spin = data;
+                return RX_OK;
+            }
+            //Data not agree
+            else
+                return RX_READING;
+
+        }
+        return RX_READING;
+    }
+    return RX_FREE;
+}
+
+//Writes data on PIC
+void writePIC(char address, short data){
+    char sendBytes[] = {0,0,0,0};
+    char dataH = data>>8;
+    std::stringstream ss;
+
+    //Put data on message pattern
+    sendBytes[0] = (address>>2) & 0b00111111;
+    sendBytes[1] = 0b01000000 | ((address << 4) & 0b00110000) | ((dataH >> 4) & 0b00001111);
+    sendBytes[2] = 0b10000000 | ((dataH << 2) & 0b00111100) | ((data >> 6) & 0b00000011);
+    sendBytes[3] = 0b11000000 | (data & 0b00111111);
+
+    //Sends over serial
+    int i;
+    for(i = 0; i < 4; i++){
+        ss << sendBytes[i];
+        uart_port.write(ss.str());
+    }
+
+}
+
+//ROUTE FUNCTIONS---------------------------------------------------------------
+
+//Reads route by txt file and applies bezier
+void readRoute(){
+    //Creates the object to read the route file
+    std::ifstream file("route.txt");
+    //String to read line
+    std::string str;
+    //route readed
+    std::vector<short int> routeXA, routeYA;
+    
+    //Comma position on string
+    int commaPos;
+    //Data string converted to int
+    short int data = 0;
+    while (std::getline(file, str))
+    {
+        //String stream to transforms string to int
+        std::stringstream ss1;
+        std::stringstream ss2;
+
+        //Read comma position on string
+        commaPos = str.find(",");
+
+        //Read position X on string
+        ss1 << str.substr(0, commaPos).c_str();
+        ss1 >> data;
+        //Add position X on route structure
+        routeXA.push_back(data);
+
+        //Read position Y on string
+        ss2 << str.substr((commaPos+1), str.size()).c_str();
+        ss2 >> data;
+        //Add position Y on route structure
+        routeYA.push_back(data);
+
+    }
+
+    file.close();
+    
+    //Count that curve is now
+    int nCurve = 0;
+    //Number of cubic curves to create
+    int curves = ((int)routeXA.size())/3;
+    
+    //While had curves to make
+    while(curves != 0){
+        //Isnt the last curve
+        if(curves > 1)
+            cubicBezier(routeXA[nCurve], routeXA[nCurve+1], routeXA[nCurve+2], routeXA[nCurve+3], ro$
+        else
+            cubicBezier(routeXA[nCurve], routeXA[nCurve+1], routeXA[nCurve+2], routeXA[nCurve+3], ro$
+        nCurve+=3;
+        curves--;
+    }
+}
+
+//Applies bezier cubic function 
+void cubicBezier(short int x1, short int x2, short int x3, short int x4, short int y1, short int y2,$
+    for (float t = 0.0; t < 1.0; t+=0.1) {
+        routeX.push_back(((short int)(pow(1-t, 3)*x1 + 3*t*pow(1-t, 2)*x2 + 3*pow(t, 2)*(1-t)*x3 + p$
+        routeY.push_back(((short int)(pow(1-t, 3)*y1 + 3*t*pow(1-t, 2)*y2 + 3*pow(t, 2)*(1-t)*y3 + p$
+    }
+    if(lastCurve == 1){
+        routeX.push_back(x4);
+        routeY.push_back(y4);
+    }
+}
+
+//SONAR FUNCTIONS--------------------------------------------------
+void sonarCallback(const std_msgs::Int16::ConstPtr& msg){
+        o_dist = msg->data;
+}
+
+//NAVIGATION FUNCTIONS------------------------------------------------------------------------------$
+
+//Calculates the distance between initial and target coordinate
+float calculeDistance(short int targetPosX, short int targetPosY, short int currentPosX, short int c$
+    if(targetPosX >= currentPosX && targetPosY > currentPosY){
+        dx = targetPosX - currentPosX;
+        dy = targetPosY - currentPosY;
+        quadrant = 1;
+    }
+    else if(targetPosX > currentPosX && targetPosY <= currentPosY){
+        dx = targetPosX - currentPosX;
+        dy = currentPosY - targetPosY;
+        quadrant = 2;
+    }
+    else if(targetPosX <= currentPosX && targetPosY < currentPosY){
+        dx = currentPosX - targetPosX;
+        dy = currentPosY - targetPosY;
+        quadrant = 3;
+    }
+    else if(targetPosX < currentPosX && targetPosY >= currentPosY){
+        dx = currentPosX - targetPosX;
+        dy = targetPosY - currentPosY;
+        quadrant = 4;
+    }
+    return sqrt(pow((dx), 2) + pow((dy), 2));
+}
+
+//Calculates the angular displacement to target coordinate direction
+short int calculeAngularDisplacement(float distance, short int currentOrientation){
+    short int teta = 0;
+    short int alfa = 0;
+    short int angularDisplacement = 0;
+    
+    if(currentOrientation >= 0 && currentOrientation < 90){
+        teta = currentOrientation;
+        alfa = (short int)(asin((float)dy/distance)*57.2958);
+
+        if(quadrant == 1)
+            angularDisplacement = 90-teta-alfa;
+
+        else if(quadrant == 2)
+            angularDisplacement = 90-teta+alfa;
+
+        else if(quadrant == 3)
+            angularDisplacement = -90-teta-alfa;
+
+        else if(quadrant == 4)
+            angularDisplacement = -90-teta+alfa;
+
+    }
+    else if(currentOrientation >= 90 && currentOrientation < 180){
+        teta = currentOrientation - 90;
+        alfa = (short int)(asin((float)dx/distance)*57.2958);
+
+        if(quadrant == 1)
+            angularDisplacement = -90-teta+alfa;
+
+        else if(quadrant == 2)
+            angularDisplacement = 90-teta-alfa;
+
+        else if(quadrant == 3)
+            angularDisplacement = 90-teta+alfa;
+
+        else if(quadrant == 4)
+            angularDisplacement = -90-teta-alfa;
+    }
+    else if(currentOrientation >= 180 && currentOrientation < 270){
+        teta = currentOrientation - 180;
+        alfa = (short int)(asin((float)dy/distance)*57.2958);
+
+        if(quadrant == 1)
+            angularDisplacement = -90-teta-alfa;
+
+        else if(quadrant == 2)
+            angularDisplacement = -90-teta+alfa;
+
+        else if(quadrant == 3)
+            angularDisplacement = 90-teta-alfa;
+
+        else if(quadrant == 4)
+            angularDisplacement = 90-teta+alfa;
+    }
+    else if(currentOrientation >= 270 && currentOrientation < 360){
+        teta = currentOrientation - 270;
+        alfa = (short int)(asin((float)dx/distance)*57.2958);
+
+        if(quadrant == 1)
+            angularDisplacement = 90-teta+alfa;
+
+        else if(quadrant == 2)
+            angularDisplacement = -90-teta-alfa;
+
+        else if(quadrant == 3)
+            angularDisplacement = -90-teta+alfa;
+
+        else if(quadrant == 4)
+            angularDisplacement = 90-teta-alfa;
+    }
+    
+    return angularDisplacement;
+}
+
+//Calculates the displacement in axis x step by step
+float displacementX(short int step, short int currentOrientation){
+    if(quadrant == 1)
+        return (step*sin(currentOrientation*3.14159265/180));
+    else if(quadrant == 2)
+        return (step*cos((currentOrientation-90)*3.14159265/180));
+    else if(quadrant == 3)
+        return -(step*sin((currentOrientation-180)*3.14159265/180));
+    else if(quadrant == 4)
+        return -(step*cos((currentOrientation-270)*3.14159265/180));
+    return 0;
+}
+
+//Calculates displacement in axis y step by step
+float displacementY(short int step, short int currentOrientation){
+    if(quadrant == 1)
+        return (step*cos(currentOrientation*3.14159265/180));
+    else if(quadrant == 2)
+        return -(step*sin((currentOrientation-90)*3.14159265/180));
+    else if(quadrant == 3)
+        return -(step*cos((currentOrientation-180)*3.14159265/180));
+    else if(quadrant == 4)
+        return (step*sin((currentOrientation-270)*3.14159265/180));
+    return 0;
+}
+
+//ESCAPE FUNCIONS----------------------------------------------------------------------
+
+short int getRunawayDistance(){
+        //Informs if the runaway distance has calculated by vision program
+        bool runawayCalculated = true;
+        //Informs if the first object detection
+        bool firstTime = true;
+        //Runaway distance
+        short int runawayDistance = 0;
+
+        //Wait for runaway distance
+        while(firstTime || !runawayCalculated){
+                firstTime = false;
+
+                if(runawayCalculated){
+                        //Send the object distance to the vision program
+                        std::ofstream outfile ("odist.txt");
+                        outfile << o_dist << std::endl;
+                        outfile.close();
+                }
+
+                std::string data;
+                std::ifstream infile ("rdist.txt");
+
+                //If the distance has not calculated yet
+                if(!infile.is_open())
+                        runawayCalculated = false;
+                //Distance calculated
+                else{
+                        runawayCalculated = true;
+
+                        //Saves the runaway distance to return
+                        std::stringstream ss;
+                        getline(infile,data);
+                        ss << data.c_str();
+                        ss >> runawayDistance;
+
+                        infile.close();
+                        //Remove the file
+                        remove("rdist.txt");
+                }
+        }
+        return runawayDistance;
+}
+
+void calculatesRunawayRoute(short int runawayDistance, short int p1x, short int p1y, short int p2x, $
+        short int tetaLinha = 0;
+        short int alfa = 0;
+        float deltaX = 0, deltaY = 0;
+        short int b1x = 0, b1y = 0, b2x = 0, b2y = 0;
+        short int r_dist = 0;
+
+        //Orientation on first quadrant
+        if(orientation >= 0 && orientation < 90){
+                alfa = orientation;
+
+                //Runaway distance modulus
+                r_dist = runawayDistance;
+                if(r_dist < 0)
+                        r_dist = r_dist * (-1);
+
+                //Linear displacement between p1 and b1, p2 and b2
+                deltaX = r_dist*cos(((float)alfa)*3.14159265/180);
+                deltaY = r_dist*sin(((float)alfa)*3.14159265/180);
+
+                //To left
+                if(runawayDistance < 0){
+                        b1x = p1x - deltaX;
+                        b1y = p1y + deltaY;
+                        b2x = p2x - deltaX;
+                        b2y = p2y + deltaY;
+                }
+
+                //To right
+                else{
+                        b1x = p1x + deltaX;
+                        b1y = p1y - deltaY;
+                        b2x = p2x + deltaX;
+                        b2y = p2y - deltaY;
+                }
+        }
+
+        //Orientation on second quadrant
+        else if(orientation >= 90 && orientation < 180){
+                tetaLinha = orientation - 90;
+                alfa = 90 - tetaLinha;
+
+                //Runaway distance modulus
+                r_dist = runawayDistance;
+                if(r_dist < 0)
+                        r_dist = r_dist * (-1);
+
+                //Linear displacement between p1 and b1, p2 and b2
+                deltaX = r_dist*cos(((float)alfa)*3.14159265/180);
+                deltaY = r_dist*sin(((float)alfa)*3.14159265/180);
+
+                //To left
+                if(runawayDistance < 0){
+                        b1x = p1x + deltaX;
+                        b1y = p1y + deltaY;
+                        b2x = p2x + deltaX;
+                        b2y = p2y + deltaY;
+                }
+
+                //To right
+                else{
+                        b1x = p1x - deltaX;
+                        b1y = p1y - deltaY;
+                        b2x = p2x - deltaX;
+                        b2y = p2y - deltaY;
+                }
+
+        }
+        //Orientation on third quadrant
+        else if(orientation >= 180 && orientation < 270){
+                alfa = orientation - 180;
+
+                //Runaway distance modulus
+                r_dist = runawayDistance;
+                if(r_dist < 0)
+                        r_dist = r_dist * (-1);
+
+                //Linear displacement between p1 and b1, p2 and b2
+                deltaX = r_dist*cos(((float)alfa)*3.14159265/180);
+                deltaY = r_dist*sin(((float)alfa)*3.14159265/180);
+
+                //To left
+                if(runawayDistance < 0){
+                        b1x = p1x + deltaX;
+                        b1y = p1y - deltaY;
+                        b2x = p2x + deltaX;
+                        b2y = p2y - deltaY;
+                }
+
+        }
+        //Orientation on fourth quadrant
+        else if(orientation >= 270 && orientation < 360){
+                tetaLinha = orientation - 270;
+                alfa = 90 - orientation;
+
+                //Runaway distance modulus
+                r_dist = runawayDistance;
+                if(r_dist < 0)
+                        r_dist = r_dist * (-1);
+
+                //Linear displacement between p1 and b1, p2 and b2
+                deltaX = r_dist*cos(((float)alfa)*3.14159265/180);
+                deltaY = r_dist*sin(((float)alfa)*3.14159265/180);
+
+                //To left
+                if(runawayDistance < 0){
+                        b1x = p1x - deltaX;
+                        b1y = p1y - deltaY;
+                        b2x = p2x - deltaX;
+                        b2y = p2y - deltaY;
+                }
+
+                //To right
+                else{
+                        b1x = p1x + deltaX;
+                        b1y = p1y + deltaY;
+                        b2x = p2x + deltaX;
+                        b2y = p2y + deltaY;
+                }
+        }
+
+        //Sets the last escape position
+        lastRunPosX = p1x;
+        lastRunPosY = p1y;
+
+        printf("Current position: (%d, %d)cm\nDesired position: (%d, %d)cm", p1x, p1y, p2x, p2y);
+        printf("\nEscaping %dcm ", r_dist);
+        if(runawayDistance < 0)
+                printf("to the left\n");
+        else
+                printf("to the right\n");
+
+        //Merge the route vector
+        std::vector<short int> notExecutedX, notExecutedY;
+        for(int i = routeX.size() - 1; i >= routeState; i--){
+                notExecutedX.push_back(routeX[i]);
+                notExecutedY.push_back(routeY[i]);
+                routeX.pop_back();
+                routeY.pop_back();
+        }
+        //Creates escape curve
+        cubicBezier(p1x, b1x, b2x, p2x, p1y, b1y, b2y, p2y, 0);
+
+        //Joint the vector merged now with the escape curve
+        for(int i = notExecutedX.size() - 1; i >= 0; i--){
+                routeX.push_back(notExecutedX[i]);
+                routeY.push_back(notExecutedY[i]);
+        }
+
+        printf("\nNew route:\n");
+        for(int i = 0; i < routeX.size(); i++){
+                if(i == routeState)
+                        printf("%d, %d <- current\n", routeX[i], routeY[i]);
+                else
+                        printf("%d, %d\n", routeX[i], routeY[i]);
+
+        }
+        printf("\n");
+}
+
+
+
+
+
+
+
+
+
+
+

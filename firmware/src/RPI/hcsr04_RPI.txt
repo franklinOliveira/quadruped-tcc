@@ -1,0 +1,71 @@
+#include <stdio.h>
+#include <wiringPi.h>
+#include <ros/ros.h>
+#include <std_msgs/Int16.h>
+
+#define TRIGGER     28
+#define ECHO        27
+
+int main (int argc, char **argv)
+{
+
+  //Start GPIO
+  wiringPiSetup () ;
+  //Set the trigger pin as output to sonar
+  pinMode (TRIGGER, OUTPUT) ;
+  //Set the echo pin as input to sonar
+  pinMode(ECHO, INPUT);
+  //Duration for sound travel
+  int duration = 0;
+
+  //CREATES A NODE HANDLE AND A PUBLISHER TO quadruped_chatter---------------------------
+  ros::init(argc, argv, "sonar");
+  ros::NodeHandle n;
+  ros::Publisher pub = n.advertise<std_msgs::Int16>("sonar_chatter", 10);
+  //-------------------------------------------------------------------------------------
+
+  while(ros::ok())
+  {
+        std_msgs::Int16 msg;
+
+        // Clears the trigPin
+        digitalWrite(TRIGGER, LOW);
+        delayMicroseconds(2);
+        // Sets the trigPin on HIGH state for 10 micro seconds
+        digitalWrite(TRIGGER, HIGH);
+        delayMicroseconds(10);
+        digitalWrite(TRIGGER, LOW);
+
+        int bail = 0;
+        // Wait for echo. Very rarely (2 of 12K at 20Hz)
+        while(digitalRead(ECHO) == LOW){
+           delayMicroseconds(1);
+           if(bail>1000000)
+             break;
+           bail++;
+        }
+
+        if(bail <= 1000000){
+           //Start echo read
+           while(digitalRead(ECHO) == HIGH){
+               duration++;
+               delayMicroseconds(1);
+           }
+            if(bail <= 1000000){
+               //Start echo read
+               while(digitalRead(ECHO) == HIGH){
+                   duration++;
+                   delayMicroseconds(1);
+               }
+
+               // Calculating the distance
+               msg.data = duration*0.034;
+               duration = 0;
+               printf("Distance: %dcm\n", msg.data);
+               delay(500);
+            }
+            pub.publish(msg);
+            ros::spinOnce();
+      }
+      return 0 ;
+    }
